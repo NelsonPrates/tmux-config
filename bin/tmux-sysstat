@@ -196,7 +196,9 @@ battery() {
 find_ssh() {
   local line rest comm p c q depth kids
   SSH_PID=''
-  read -r line < "/proc/$1/stat" 2>/dev/null || return 1
+  # 2>/dev/null must come first: redirections apply left to right, and the
+  # process may be gone by now
+  read -r line 2>/dev/null < "/proc/$1/stat" || return 1
   rest=${line##*) }; set -- $rest          # $6 = tpgid (foreground process group)
   local fg=$6
   ((fg > 0)) || return 1
@@ -204,9 +206,9 @@ find_ssh() {
   for ((depth = 0; depth < 3 && ${#q[@]}; depth++)); do
     kids=()
     for p in "${q[@]}"; do
-      read -r comm < "/proc/$p/comm" 2>/dev/null || continue
+      read -r comm 2>/dev/null < "/proc/$p/comm" || continue
       if [[ $comm == ssh ]]; then SSH_PID=$p; return 0; fi
-      read -r -a c < "/proc/$p/task/$p/children" 2>/dev/null && kids+=("${c[@]}")
+      read -r -a c 2>/dev/null < "/proc/$p/task/$p/children" && kids+=("${c[@]}")
     done
     q=("${kids[@]}")
   done
@@ -221,7 +223,7 @@ find_ssh() {
 parse_ssh() {
   local -a av; local a c j optarg i=1 n dashdash=0
   SSH_OPTS=(); SSH_DEST=''
-  mapfile -d '' -t av < "/proc/$1/cmdline" 2>/dev/null || return 1
+  mapfile -d '' -t av 2>/dev/null < "/proc/$1/cmdline" || return 1
   n=${#av[@]}
   while ((i < n)); do
     a=${av[i]}; ((i++))
@@ -263,7 +265,8 @@ monitor_start() {
   # the child must not inherit the lock or other monitors' pipes
   exec {fd}< <(
     exec 9>&- {sleep_fd}>&-
-    for f in "${M_FD[@]}"; do exec {f}<&-; done
+    # stopped/failed monitors keep an empty fd entry: skip those
+    for f in "${M_FD[@]}"; do [[ -n $f ]] && exec {f}<&-; done
     exec ssh "${SSH_BASE[@]}" "${SSH_OPTS[@]}" -- "$SSH_DEST" 'sh -s' \
       <<<"$REMOTE_SCRIPT" 2>"$RUN_DIR/$k.err"
   )
