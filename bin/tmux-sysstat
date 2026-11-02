@@ -2,17 +2,28 @@
 # tmux-sysstat - low-overhead system stats collector for the tmux status line.
 #
 # Every $TMUX_SYSSTAT_INTERVAL seconds (default 2) it samples CPU, memory,
-# WiFi throughput, root disk usage and battery, then publishes the results as
-# tmux global user options. The status line only references #{@sys_*}
-# variables, so tmux never forks a #() job on redraw.
+# network throughput and root disk usage of the host the active pane is on,
+# plus the local battery, and publishes the results as tmux global user
+# options. The status line only references #{@sys_*} variables, so tmux never
+# forks a #() job on redraw.
+#
+# Host of the active pane:
+#   - local pane      -> local metrics (/proc, /sys), network = WiFi interface
+#   - pane running ssh -> metrics of the remote server, network = interface of
+#     its default route. The collector opens its own background ssh connection
+#     with the same connection options (BatchMode, never prompts) and streams
+#     libexec/remote-stats.sh to `sh -s` on the server: nothing is installed
+#     there, and the remote side exits by itself when the connection closes.
+#     The connection is kept for $TMUX_SYSSTAT_REMOTE_GRACE seconds (default
+#     120) after the pane stops being active, so switching back is instant.
 #
 # Options published:
 #   @sys_cpu_bar  @sys_cpu   CPU usage: 5-block bar + "NNN%"
 #   @sys_mem_bar  @sys_mem   memory usage: 5-block bar + "NNN% U.U/TG"
-#   @sys_wifi                WiFi rate "↓  1.2M ↑  300K" (or "no wifi"/"down")
+#   @sys_net                 "WiFi ↓  1.2M ↑  300K" (remote: "NET  ↓ ...")
 #   @sys_disk                root filesystem "NNN% (  33G free)"
-#   @sys_bat                 battery "↑ <4-block bar> NNN%" (empty if none)
-#   @sys_user                user name (set once at startup)
+#   @sys_bat                 local battery "↑ <4-block bar> NNN%" (empty if none)
+#   @sys_user  @sys_host     user and host the metrics belong to
 #
 # Every value has a fixed width so the status line does not shift around.
 #
@@ -21,28 +32,41 @@
 # longer talk to the server.
 #
 # Cost: the loop uses bash builtins only; each cycle forks exactly one `tmux`
-# client, plus one `df` every DISK_EVERY cycles.
+# client, plus one `df` every DISK_EVERY cycles. Remote mode adds one idle
+# ssh process locally and one awk (+ sleep) on the server.
 #
-# Requires: Linux (/proc, /sys), bash >= 5.0 (EPOCHREALTIME, namerefs), flock.
+# Requires: Linux (/proc, /sys), bash >= 5.0, flock; ssh for remote metrics.
+# Debug logs: $XDG_RUNTIME_DIR/tmux-sysstat/<socket>.log and <ssh-pid>.err
 
 INTERVAL=${TMUX_SYSSTAT_INTERVAL:-2}
-DISK_EVERY=15            # refresh disk usage every 15 cycles (30s by default)
+REMOTE_GRACE=${TMUX_SYSSTAT_REMOTE_GRACE:-120}
+REMOTE_RETRY=30          # seconds before retrying a failed remote connection
+DISK_EVERY=15            # refresh local disk usage every 15 cycles (30s)
 SYM_FULL='◼'
 SYM_EMPTY='◻'
+DIM=colour240            # bars when there is no data
 # Oh my tmux! "gradient" palette, red -> green
 GRADIENT=(colour196 colour202 colour208 colour214 colour220 colour226 colour190 colour154 colour118 colour82 colour46)
 BAT_CHARGING='↑'
 BAT_DISCHARGING='↓'
 
+SELF_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)
+REMOTE_SCRIPT_FILE=$SELF_DIR/../libexec/remote-stats.sh
+
 # --- single instance per tmux server ---------------------------------------
 sock=${TMUX%%,*}
-lock="${XDG_RUNTIME_DIR:-/tmp}/tmux-sysstat-$UID-${sock//\//_}.lock"
-exec 9>"$lock"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/tmux-sysstat"
+mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
+exec 9>"$RUN_DIR/${sock//\//_}.lock"
 flock -n 9 || exit 0
+exec 2>"$RUN_DIR/${sock//\//_}.log"
 
 # interruptible sleep without forking `sleep`
 exec {sleep_fd}<> <(:)
 nap() { read -r -t "$1" -u "$sleep_fd" || :; }
+
+REMOTE_SCRIPT=''
+[[ -r $REMOTE_SCRIPT_FILE ]] && REMOTE_SCRIPT="IV=$INTERVAL"$'\n'"$(<"$REMOTE_SCRIPT_FILE")"
 
 # --- bars --------------------------------------------------------------------
 
@@ -57,6 +81,7 @@ sample_palette() {
 REVERSED=(); for ((i = ${#GRADIENT[@]} - 1; i >= 0; i--)); do REVERSED+=("${GRADIENT[i]}"); done
 sample_palette LOAD_COLORS 5 "${REVERSED[@]}"   # CPU / MEM: green (idle) -> red (busy)
 sample_palette BAT_COLORS 4 "${GRADIENT[@]}"    # battery:   red (empty) -> green (full)
+NA_BAR="#[fg=$DIM]$SYM_EMPTY$SYM_EMPTY$SYM_EMPTY$SYM_EMPTY$SYM_EMPTY"
 
 # bar <percent> <colors-array> -> sets $BAR
 # Leaves fg on the last filled block's color so the following text matches it.
@@ -70,7 +95,7 @@ bar() {
   BAR="$out#[fg=${_c[full > 0 ? full - 1 : 0]}]"
 }
 
-# --- formatting --------------------------------------------------------------
+# --- formatting (each sets the published variables) --------------------------
 
 # human <bytes/s> -> sets $HUMAN, always 6 columns ("    0B", "  999K", "  1.2M")
 human() {
@@ -86,7 +111,44 @@ human() {
   fi
 }
 
-# --- collectors --------------------------------------------------------------
+# size_kb <KiB> -> sets $SIZE like `df -h` ("33G", "1.5T", "512M")
+size_kb() {
+  local x10=$(( $1 * 10 )) u=0 units=(K M G T P)
+  while ((x10 >= 10240 && u < 4)); do x10=$(( (x10 + 512) / 1024 )); ((u++)); done
+  if ((x10 < 100)); then SIZE="$((x10 / 10)).$((x10 % 10))${units[u]}"
+  else SIZE="$(( (x10 + 5) / 10 ))${units[u]}"; fi
+}
+
+fmt_cpu() { bar "$1" LOAD_COLORS; cpu_bar=$BAR; printf -v cpu_txt '%3d%%' "$1"; }
+
+# fmt_mem <total_kb> <available_kb>
+fmt_mem() {
+  local mt=$1 ma=$2 mem=0 tg ut
+  ((mt > 0)) && mem=$(( (mt - ma) * 100 / mt ))
+  bar "$mem" LOAD_COLORS; mem_bar=$BAR
+  tg=$(( (mt + 524288) / 1048576 )); ut=$(( ((mt - ma) * 10 + 524288) / 1048576 ))
+  printf -v mem_txt "%3d%% %$(( ${#tg} + 2 ))s/%dG" "$mem" "$((ut / 10)).$((ut % 10))" "$tg"
+}
+
+# fmt_net <label> <rx B/s> <tx B/s>   |   fmt_net <label> -msg <15-col text>
+fmt_net() {
+  local r t
+  if [[ $2 == -msg ]]; then printf -v net_txt '%-4s %-15s' "$1" "$3"; return; fi
+  human "$2"; r=$HUMAN; human "$3"; t=$HUMAN
+  printf -v net_txt '%-4s ↓%s ↑%s' "$1" "$r" "$t"
+}
+
+# fmt_disk <percent> <available_kb>
+fmt_disk() { size_kb "$2"; printf -v disk_txt '%3d%% (%5s free)' "$1" "$SIZE"; }
+
+fmt_na() {   # remote host without data yet: <net message>
+  cpu_bar=$NA_BAR; cpu_txt=' n/a'; mem_bar=$NA_BAR
+  printf -v mem_txt '%-13s' ' n/a'          # same width as " 45% 13.9/31G"
+  fmt_net NET -msg "$1"
+  printf -v disk_txt '%-18s' ' n/a'         # same width as " 93% (  31G free)"
+}
+
+# --- local collectors --------------------------------------------------------
 
 read_cpu() { local _; read -r _ u n s i w q sq st _ < /proc/stat; CPU_T=$((u+n+s+i+w+q+sq+st)); CPU_I=$((i+w)); }
 
@@ -127,62 +189,221 @@ battery() {
   printf -v BAT '%s %s%3d%%' "$sym" "$BAR" "$pct"
 }
 
+# --- remote host detection ---------------------------------------------------
+
+# find_ssh <pane-pid> -> sets $SSH_PID to the ssh client running in the
+# foreground of the pane (directly, or under a wrapper such as sshpass/autossh)
+find_ssh() {
+  local line rest comm p c q depth kids
+  SSH_PID=''
+  read -r line < "/proc/$1/stat" 2>/dev/null || return 1
+  rest=${line##*) }; set -- $rest          # $6 = tpgid (foreground process group)
+  local fg=$6
+  ((fg > 0)) || return 1
+  q=("$fg")
+  for ((depth = 0; depth < 3 && ${#q[@]}; depth++)); do
+    kids=()
+    for p in "${q[@]}"; do
+      read -r comm < "/proc/$p/comm" 2>/dev/null || continue
+      if [[ $comm == ssh ]]; then SSH_PID=$p; return 0; fi
+      read -r -a c < "/proc/$p/task/$p/children" 2>/dev/null && kids+=("${c[@]}")
+    done
+    q=("${kids[@]}")
+  done
+  return 1
+}
+
+# parse_ssh <pid> -> sets SSH_OPTS (connection options only) and SSH_DEST.
+# Mirrors ssh's own parsing: options may also follow the destination; the
+# first non-option after it starts the remote command (dropped).
+# Kept:    -4 -6 -C and -b -c -i -l -m -o -p -B -F -I -J -P -S <arg>
+# Dropped: forwarding, tty, verbosity, control and other session flags.
+parse_ssh() {
+  local -a av; local a c j optarg i=1 n dashdash=0
+  SSH_OPTS=(); SSH_DEST=''
+  mapfile -d '' -t av < "/proc/$1/cmdline" 2>/dev/null || return 1
+  n=${#av[@]}
+  while ((i < n)); do
+    a=${av[i]}; ((i++))
+    if ((dashdash)) || [[ $a != -?* ]]; then
+      [[ -n $SSH_DEST ]] && break
+      SSH_DEST=$a; continue
+    fi
+    if [[ $a == -- ]]; then dashdash=1; continue; fi
+    for ((j = 1; j < ${#a}; j++)); do
+      c=${a:j:1}
+      case $c in
+        [bcilmopBFIJPS]|[eDELOQRwW])           # options that take an argument
+          optarg=${a:j+1}
+          if [[ -z $optarg ]]; then optarg=${av[i]}; ((i++)); fi
+          case $c in [bcilmopBFIJPS]) SSH_OPTS+=("-$c" "$optarg") ;; esac
+          break ;;
+        [46C]) SSH_OPTS+=("-$c") ;;
+      esac
+    done
+  done
+  [[ -n $SSH_DEST ]]
+}
+
+# --- remote monitors (one per ssh client pid) --------------------------------
+
+declare -A M_FD M_PID M_LINE M_STATE M_SEEN M_FAILED M_DEST
+# M_STATE: connecting | ok | failed | unsupported
+
+# our options come first: for ssh the first value obtained wins
+SSH_BASE=(-T -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15
+          -o ServerAliveCountMax=3 -o ControlMaster=no -o RemoteCommand=none
+          -o RequestTTY=no -o ClearAllForwardings=yes -o PermitLocalCommand=no
+          -o ForwardAgent=no -o ForwardX11=no -o LogLevel=ERROR)
+
+monitor_start() {
+  local k=$1 fd
+  parse_ssh "$k" || { M_STATE[$k]=failed; M_FAILED[$k]=$EPOCHSECONDS; return; }
+  M_DEST[$k]=$SSH_DEST
+  # the child must not inherit the lock or other monitors' pipes
+  exec {fd}< <(
+    exec 9>&- {sleep_fd}>&-
+    for f in "${M_FD[@]}"; do exec {f}<&-; done
+    exec ssh "${SSH_BASE[@]}" "${SSH_OPTS[@]}" -- "$SSH_DEST" 'sh -s' \
+      <<<"$REMOTE_SCRIPT" 2>"$RUN_DIR/$k.err"
+  )
+  M_FD[$k]=$fd; M_PID[$k]=$!; M_STATE[$k]=connecting; M_LINE[$k]=''
+}
+
+monitor_stop() {
+  local k=$1 fd=${M_FD[$1]}
+  [[ -n ${M_PID[$k]} ]] && kill "${M_PID[$k]}" 2>/dev/null
+  [[ -n $fd ]] && exec {fd}<&-
+  [[ -n ${M_PID[$k]} ]] && wait "${M_PID[$k]}" 2>/dev/null
+  M_FD[$k]=''; M_PID[$k]=''
+}
+
+monitor_forget() {
+  monitor_stop "$1"
+  unset 'M_FD[$1]' 'M_PID[$1]' 'M_LINE[$1]' 'M_STATE[$1]' 'M_SEEN[$1]' 'M_FAILED[$1]' 'M_DEST[$1]'
+  rm -f "$RUN_DIR/$1.err"
+}
+
+# drain every complete line available without blocking; keep the latest
+monitor_poll() {
+  local k=$1 fd=${M_FD[$1]} l
+  [[ -n $fd ]] || return
+  while read -r -t 0 -u "$fd"; do
+    if IFS= read -r -t 1 -u "$fd" l; then
+      case $l in
+        OK\ *) M_LINE[$k]=$l; M_STATE[$k]=ok ;;
+        ERR\ unsupported) M_STATE[$k]=unsupported ;;
+      esac
+    else                                    # EOF: ssh exited
+      monitor_stop "$k"
+      [[ ${M_STATE[$k]} == unsupported ]] || { M_STATE[$k]=failed; M_FAILED[$k]=$EPOCHSECONDS; }
+      return
+    fi
+  done
+}
+
+cleanup() { local k; for k in "${!M_STATE[@]}"; do monitor_forget "$k"; done; }
+trap cleanup EXIT
+trap 'exit 0' TERM INT HUP
+
+# render_remote <ssh-pid>: fill the published variables from the monitor
+render_remote() {
+  local k=$1 dest=${M_DEST[$1]} _ cpu mt ma ifc rxr txr dp da ru rh
+  case ${M_STATE[$k]} in
+    ok)
+      read -r _ cpu mt ma ifc rxr txr dp da ru rh <<<"${M_LINE[$k]}"
+      fmt_cpu "$cpu"; fmt_mem "$mt" "$ma"; fmt_net NET "$rxr" "$txr"; fmt_disk "$dp" "$da"
+      user_txt=$ru; host_txt=$rh
+      return ;;
+    connecting)  fmt_na ' connecting...' ;;
+    unsupported) fmt_na '  unsupported' ;;
+    *)           fmt_na '  ssh failed' ;;
+  esac
+  # no data yet: show the destination from the command line
+  dest=${dest#ssh://}; dest=${dest%%:*}
+  if [[ $dest == *@* ]]; then user_txt=${dest%@*}; host_txt=${dest#*@}
+  else user_txt=$USER; host_txt=$dest; fi
+}
+
 # --- main loop ---------------------------------------------------------------
 
-tmux set -gq @sys_user "${USER:-$(id -un)}" 2>/dev/null || exit 0
+read -r LOCAL_HOST < /proc/sys/kernel/hostname
+LOCAL_USER=${USER:-$(id -un)}
 
 wifi_iface
 read_cpu; pt=$CPU_T; pi=$CPU_I
 read_net; prx=$RX; ptx=$TX
-cycle=0; DISK=''
+cycle=0; L_DISK=''
 t_prev=$EPOCHREALTIME
+pane_pid=''; quick=0
 
 while :; do
-  nap "$INTERVAL"
+  if ((quick)); then nap 0.3; quick=0; else nap "$INTERVAL"; fi
   t_now=$EPOCHREALTIME
   # elapsed ms (EPOCHREALTIME uses the locale's decimal separator: '.' or ',')
   a=${t_prev//[.,]/}; b=${t_now//[.,]/}; ms=$(( (10#$b - 10#$a) / 1000 )); ((ms > 0)) || ms=1
   t_prev=$t_now
+  now=$EPOCHSECONDS
 
-  # CPU
+  # local samples are always taken so rates stay correct when switching back
   read_cpu
   dt=$((CPU_T - pt)); di=$((CPU_I - pi)); pt=$CPU_T; pi=$CPU_I
-  cpu=0; ((dt > 0)) && cpu=$(( (dt - di) * 100 / dt ))
-  bar "$cpu" LOAD_COLORS; cpu_bar=$BAR; printf -v cpu_txt '%3d%%' "$cpu"
+  l_cpu=0; ((dt > 0)) && l_cpu=$(( (dt - di) * 100 / dt ))
 
-  # memory: used = MemTotal - MemAvailable
   mt=0; ma=0
   while read -r k v _; do
     case $k in MemTotal:) mt=$v ;; MemAvailable:) ma=$v; break ;; esac
   done < /proc/meminfo
-  mem=0; ((mt > 0)) && mem=$(( (mt - ma) * 100 / mt ))
-  bar "$mem" LOAD_COLORS; mem_bar=$BAR
-  tg=$(( (mt + 524288) / 1048576 )); ut=$(( ((mt - ma) * 10 + 524288) / 1048576 ))
-  printf -v mem_txt "%3d%% %$(( ${#tg} + 2 ))s/%dG" "$mem" "$((ut / 10)).$((ut % 10))" "$tg"
 
-  # WiFi (re-detect the interface if it went away, e.g. after suspend)
   [[ -n $IFACE && -d /sys/class/net/$IFACE ]] || { wifi_iface; read_net; prx=$RX; ptx=$TX; }
   read_net
-  if [[ -z $IFACE ]]; then wifi='    no wifi    '
-  elif ((NET_UP == 0)); then wifi='     down      '
-  else
-    human $(( (RX - prx) * 1000 / ms )); r=$HUMAN
-    human $(( (TX - ptx) * 1000 / ms )); t=$HUMAN
-    wifi="↓$r ↑$t"
-  fi
-  prx=$RX; ptx=$TX
+  l_rx=$(( (RX - prx) * 1000 / ms )); l_tx=$(( (TX - ptx) * 1000 / ms )); prx=$RX; ptx=$TX
 
-  # disk usage of the root filesystem (changes slowly)
   if ((cycle % DISK_EVERY == 0)); then
-    { read -r _; read -r _ _ _ avail pct _; } < <(LC_ALL=C df -h /)
-    printf -v DISK '%4s (%5s free)' "$pct" "$avail"
+    { read -r _; read -r _ _ _ l_davail l_dpct _; } < <(LC_ALL=C df -kP /)
+    l_dpct=${l_dpct%\%}
   fi
   ((cycle++))
 
   battery
 
-  tmux set -gq @sys_cpu_bar "$cpu_bar" \; set -gq @sys_cpu "$cpu_txt" \
-       \; set -gq @sys_mem_bar "$mem_bar" \; set -gq @sys_mem "$mem_txt" \
-       \; set -gq @sys_wifi "$wifi" \; set -gq @sys_disk "$DISK" \
-       \; set -gq @sys_bat "$BAT" 2>/dev/null || exit 0
+  # remote host of the active pane, if it is running ssh
+  target=''
+  if [[ -n $REMOTE_SCRIPT && -n $pane_pid ]] && find_ssh "$pane_pid"; then
+    target=$SSH_PID
+    M_SEEN[$target]=$now
+    if [[ -z ${M_STATE[$target]} ]] ||
+       [[ ${M_STATE[$target]} == failed && $((now - ${M_FAILED[$target]:-0})) -ge $REMOTE_RETRY ]]; then
+      monitor_start "$target"
+    fi
+  fi
+  for k in "${!M_STATE[@]}"; do
+    monitor_poll "$k"
+    # forget monitors whose ssh client exited or that were idle for too long
+    if [[ ! -d /proc/$k ]] || ((now - ${M_SEEN[$k]:-0} > REMOTE_GRACE)); then monitor_forget "$k"; fi
+  done
+
+  if [[ -n $target && -n ${M_STATE[$target]} ]]; then
+    render_remote "$target"
+  else
+    fmt_cpu "$l_cpu"; fmt_mem "$mt" "$ma"
+    if [[ -z $IFACE ]]; then fmt_net WiFi -msg '    no wifi'
+    elif ((NET_UP == 0)); then fmt_net WiFi -msg '     down'
+    else fmt_net WiFi "$l_rx" "$l_tx"; fi
+    fmt_disk "${l_dpct:-0}" "${l_davail:-0}"
+    user_txt=$LOCAL_USER; host_txt=$LOCAL_HOST
+  fi
+
+  # publish, and learn the active pane of the most recently used client
+  out=$(tmux set -gq @sys_cpu_bar "$cpu_bar" \; set -gq @sys_cpu "$cpu_txt" \
+             \; set -gq @sys_mem_bar "$mem_bar" \; set -gq @sys_mem "$mem_txt" \
+             \; set -gq @sys_net "$net_txt" \; set -gq @sys_disk "$disk_txt" \
+             \; set -gq @sys_bat "$BAT" \; set -gq @sys_user "$user_txt" \
+             \; set -gq @sys_host "$host_txt" \
+             \; list-clients -F '#{client_activity} #{pane_pid}') || exit 0
+  best=-1; new_pane=''
+  while read -r act pp; do ((act > best)) && { best=$act; new_pane=$pp; }; done <<<"$out"
+  # pane changed: refresh almost immediately instead of waiting a full cycle
+  [[ $new_pane != "$pane_pid" ]] && quick=1
+  pane_pid=$new_pane
 done
