@@ -6,18 +6,18 @@ WiFi throughput, disk usage and battery, refreshed every 2 seconds at almost no
 CPU cost.
 
 ```
-CPU ◼◻◻◻◻  14% | MEM ◼◼◻◻◻  44% 13.8/31G | WiFi ↓    1K ↑    1K | DISK  93% (  32G free) | ↑ ◼◼◼◼  93% | 15:17 | 02 Nov  user  hostname
+↑ ◼◼◼◼  93% | CPU ◼◻◻◻◻  14% | MEM ◼◼◻◻◻  44% 13.8/31G | WiFi ↓    1K ↑    1K | DISK  93% (  32G free) | 15:17 | 02 Nov  user  hostname
 ```
 
 ## Features
 
 | Segment | Shows | Width |
 | --- | --- | --- |
+| **Battery** | charging ↑ / discharging ↓, 4-block bar, charge % | fixed |
 | **CPU** | 5-block bar + usage %, sampled over the refresh interval | fixed |
 | **MEM** | 5-block bar + used % + used/total GiB (`MemTotal - MemAvailable`) | fixed |
 | **WiFi** | download ↓ and upload ↑ rate of the wireless interface (auto-detected) | fixed |
 | **DISK** | usage % and free space of `/` | fixed |
-| **Battery** | charging ↑ / discharging ↓, 4-block bar, charge % | fixed |
 
 - Bars use the Oh my tmux! `gradient` palette. CPU and memory use it reversed
   (green near 0%, red near 100%), while the battery keeps the original
@@ -82,7 +82,7 @@ this repository, ready to commit.
 All settings live in [`tmux.conf.local`](tmux.conf.local), following the
 Oh my tmux! conventions. The main changes from the upstream template are:
 
-- `tmux_conf_theme_status_right`: the CPU / MEM / WiFi / DISK / battery
+- `tmux_conf_theme_status_right`: the battery / CPU / MEM / WiFi / DISK
   segments, with the user name from `#{@sys_user}` and the hostname from `#h`
   (both job-free);
 - `tmux_conf_battery_bar_length="4"`;
